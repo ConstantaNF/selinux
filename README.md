@@ -354,6 +354,316 @@ Jun 18 09:34:44 selinux systemd[1]: Started The nginx HTTP and reverse proxy ser
 
 Задание выполнено.
 
+### **2. Обеспечение работоспособности приложения при включенном SELinux** ###
+
+Выполним клонирование репозитория:
+
+```
+adminkonstantin@2OSUbuntu:~/selinux_dns_problems$ git clone https://github.com/mbfx/otus-linux-adm.git
+Клонирование в «otus-linux-adm»...
+remote: Enumerating objects: 558, done.
+remote: Counting objects: 100% (456/456), done.
+remote: Compressing objects: 100% (303/303), done.
+remote: Total 558 (delta 125), reused 396 (delta 74), pack-reused 102
+Получение объектов: 100% (558/558), 1.38 МиБ | 4.47 МиБ/с, готово.
+Определение изменений: 100% (140/140), готово.
+```
+
+Перейдём в каталог со стендом и развернём 2 ВМ с помощью vagrant:
+
+```
+adminkonstantin@2OSUbuntu:~/selinux$ cd otus-linux-adm/selinux_dns_problems/
+```
+
+```
+adminkonstantin@2OSUbuntu:~/selinux/otus-linux-adm/selinux_dns_problems$ vagrant up
+Bringing machine 'ns01' up with 'virtualbox' provider...
+Bringing machine 'client' up with 'virtualbox' provider...
+
+...
+
+LAY RECAP *********************************************************************
+ns01                       : ok=14   changed=12   unreachable=0    failed=0    skipped=0    rescued=0    ignored=0   
+
+...
+
+PLAY RECAP *********************************************************************
+client                     : ok=7    changed=5    unreachable=0    failed=0    skipped=0    rescued=0    ignored=0   
+```
+
+Проверим наличие ВМ:
+
+```
+adminkonstantin@2OSUbuntu:~/selinux/otus-linux-adm/selinux_dns_problems$ vagrant status
+Current machine states:
+
+ns01                      running (virtualbox)
+client                    running (virtualbox)
+
+This environment represents multiple VMs. The VMs are all listed
+above with their current state. For more information about a specific
+VM, run `vagrant status NAME`.
+```
+
+Подключимся к клиенту:
+
+```
+adminkonstantin@2OSUbuntu:~/selinux/otus-linux-adm/selinux_dns_problems$ vagrant ssh client
+Last login: Tue Jun 18 10:09:37 2024 from 10.0.2.2
+###############################
+### Welcome to the DNS lab! ###
+###############################
+
+- Use this client to test the enviroment
+- with dig or nslookup. Ex:
+    dig @192.168.50.10 ns01.dns.lab
+
+- nsupdate is available in the ddns.lab zone. Ex:
+    nsupdate -k /etc/named.zonetransfer.key
+    server 192.168.50.10
+    zone ddns.lab 
+    update add www.ddns.lab. 60 A 192.168.50.15
+    send
+
+- rndc is also available to manage the servers
+    rndc -c ~/rndc.conf reload
+
+###############################
+### Enjoy! ####################
+###############################
+[vagrant@client ~]$ 
+```
+
+Попробуем внести изменения в зону:
+
+```
+[vagrant@client ~]$ nsupdate -k /etc/named.zonetransfer.key
+> server 192.168.50.10
+> zone ddns.lab
+> update add www.ddns.lab. 60 A 192.168.50.15
+> send
+update failed: SERVFAIL
+> quit
+[vagrant@client ~]$ 
+```
+
+Изменения внести не получилось. Посмотрим логи SELinux, чтобы понять в чём может быть проблема. Для этого воспользуемся утилитой audit2why:
+
+```
+[vagrant@client ~]$ sudo -i
+[root@client ~]# cat /var/log/audit/audit.log | audit2why
+```
+
+Тут мы видим, что на клиенте отсутствуют ошибки. 
+Не закрывая сессию на клиенте, подключимся к серверу ns01 и проверим логи SELinux:
+
+```
+adminkonstantin@2OSUbuntu:~/selinux/otus-linux-adm/selinux_dns_problems$ vagrant ssh ns01
+Last login: Tue Jun 18 10:07:34 2024 from 10.0.2.2
+[vagrant@ns01 ~]$ sudo -i
+[root@ns01 ~]# cat /var/log/audit/audit.log | audit2why
+type=AVC msg=audit(1718706022.548:1969): avc:  denied  { create } for  pid=5310 comm="isc-worker0000" name="named.ddns.lab.view1.jnl" scontext=system_u:system_r:named_t:s0 tcontext=system_u:object_r:etc_t:s0 tclass=file permissive=0
+
+	Was caused by:
+		Missing type enforcement (TE) allow rule.
+
+		You can use audit2allow to generate a loadable module to allow this access.
+```
+
+В логах мы видим, что ошибка в контексте безопасности. Вместо типа named_t используется тип etc_t.
+Проверим данную проблему в каталоге /etc/named:
+
+```
+[root@ns01 ~]# ls -laZ /etc/named
+drw-rwx---. root named system_u:object_r:etc_t:s0       .
+drwxr-xr-x. root root  system_u:object_r:etc_t:s0       ..
+drw-rwx---. root named unconfined_u:object_r:etc_t:s0   dynamic
+-rw-rw----. root named system_u:object_r:etc_t:s0       named.50.168.192.rev
+-rw-rw----. root named system_u:object_r:etc_t:s0       named.dns.lab
+-rw-rw----. root named system_u:object_r:etc_t:s0       named.dns.lab.view1
+-rw-rw----. root named system_u:object_r:etc_t:s0       named.newdns.lab
+```
+
+Тут мы также видим, что контекст безопасности неправильный. Проблема заключается в том, что конфигурационные файлы лежат в другом каталоге. Посмотрим в каком каталоге должны лежать файлы, чтобы на них распространялись правильные политики SELinux:
+
+```
+[root@ns01 ~]# sudo semanage fcontext -l | grep named
+/etc/rndc.*                                        regular file       system_u:object_r:named_conf_t:s0 
+/var/named(/.*)?                                   all files          system_u:object_r:named_zone_t:s0 
+...
+```
+
+Изменим тип контекста безопасности для каталога /etc/named:
+
+```
+[root@ns01 ~]# sudo chcon -R -t named_zone_t /etc/named
+[root@ns01 ~]# ls -laZ /etc/named
+drw-rwx---. root named system_u:object_r:named_zone_t:s0 .
+drwxr-xr-x. root root  system_u:object_r:etc_t:s0       ..
+drw-rwx---. root named unconfined_u:object_r:named_zone_t:s0 dynamic
+-rw-rw----. root named system_u:object_r:named_zone_t:s0 named.50.168.192.rev
+-rw-rw----. root named system_u:object_r:named_zone_t:s0 named.dns.lab
+-rw-rw----. root named system_u:object_r:named_zone_t:s0 named.dns.lab.view1
+-rw-rw----. root named system_u:object_r:named_zone_t:s0 named.newdns.lab
+```
+
+Попробуем снова внести изменения с клиента: 
+
+```
+[root@client ~]# nsupdate -k /etc/named.zonetransfer.key
+> server 192.168.50.10
+> zone ddns.lab
+> update add www.ddns.lab. 60 A 192.168.50.15
+> send
+> quit
+[root@client ~]# dig www.ddns.lab
+
+; <<>> DiG 9.11.4-P2-RedHat-9.11.4-26.P2.el7_9.16 <<>> www.ddns.lab
+;; global options: +cmd
+;; Got answer:
+;; ->>HEADER<<- opcode: QUERY, status: NOERROR, id: 7123
+;; flags: qr aa rd ra; QUERY: 1, ANSWER: 1, AUTHORITY: 1, ADDITIONAL: 2
+
+;; OPT PSEUDOSECTION:
+; EDNS: version: 0, flags:; udp: 4096
+;; QUESTION SECTION:
+;www.ddns.lab.			IN	A
+
+;; ANSWER SECTION:
+www.ddns.lab.		60	IN	A	192.168.50.15
+
+;; AUTHORITY SECTION:
+ddns.lab.		3600	IN	NS	ns01.dns.lab.
+
+;; ADDITIONAL SECTION:
+ns01.dns.lab.		3600	IN	A	192.168.50.10
+
+;; Query time: 1 msec
+;; SERVER: 192.168.50.10#53(192.168.50.10)
+;; WHEN: Tue Jun 18 10:47:56 UTC 2024
+;; MSG SIZE  rcvd: 96
+```
+
+Видим, что изменения применились. Попробуем перезагрузить хосты и ещё раз сделать запрос с помощью dig:
+
+```
+[root@client ~]# dig @192.168.50.10 www.ddns.lab
+
+; <<>> DiG 9.11.4-P2-RedHat-9.11.4-26.P2.el7_9.16 <<>> @192.168.50.10 www.ddns.lab
+; (1 server found)
+;; global options: +cmd
+;; Got answer:
+;; ->>HEADER<<- opcode: QUERY, status: NOERROR, id: 46715
+;; flags: qr aa rd ra; QUERY: 1, ANSWER: 1, AUTHORITY: 1, ADDITIONAL: 2
+
+;; OPT PSEUDOSECTION:
+; EDNS: version: 0, flags:; udp: 4096
+;; QUESTION SECTION:
+;www.ddns.lab.			IN	A
+
+;; ANSWER SECTION:
+www.ddns.lab.		60	IN	A	192.168.50.15
+
+;; AUTHORITY SECTION:
+ddns.lab.		3600	IN	NS	ns01.dns.lab.
+
+;; ADDITIONAL SECTION:
+ns01.dns.lab.		3600	IN	A	192.168.50.10
+
+;; Query time: 1 msec
+;; SERVER: 192.168.50.10#53(192.168.50.10)
+;; WHEN: Tue Jun 18 10:51:49 UTC 2024
+;; MSG SIZE  rcvd: 96
+```
+
+Всё правильно. После перезагрузки настройки сохранились. 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
